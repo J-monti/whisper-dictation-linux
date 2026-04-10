@@ -1,0 +1,13 @@
+[Unit]
+Description=Dictation Daemon (Vosk speech-to-text)
+After=graphical-session.target
+Wants=ydotool.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/dictation
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

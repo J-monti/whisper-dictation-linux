@@ -1,0 +1,585 @@
+use anyhow::{Context, Result};
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use std::process::Command;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
+use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
+
+/// Minimum milliseconds between hotkey activations to prevent key-repeat spam
+const DEBOUNCE_MS: u64 = 500;
+/// Maximum recording duration in seconds before auto-stop
+const MAX_RECORDING_SECS: u64 = 60;
+
+const SAMPLE_RATE: u32 = 16000;
+const MAX_BUFFER_SAMPLES: usize = SAMPLE_RATE as usize * MAX_RECORDING_SECS as usize;
+const ICON_SIZE: i32 = 22;
+
+fn make_circle_icon(r: u8, g: u8, b: u8) -> ksni::Icon {
+    let size = ICON_SIZE as usize;
+    let mut data = Vec::with_capacity(size * size * 4);
+    let center = size as f32 / 2.0;
+    let radius = center - 1.0;
+
+    for y in 0..size {
+        for x in 0..size {
+            let dx = x as f32 - center;
+            let dy = y as f32 - center;
+            let dist = (dx * dx + dy * dy).sqrt();
+
+            if dist <= radius {
+                data.extend_from_slice(&[255, r, g, b]);
+            } else if dist <= radius + 1.0 {
+                let alpha = ((radius + 1.0 - dist) * 255.0) as u8;
+                data.extend_from_slice(&[alpha, r, g, b]);
+            } else {
+                data.extend_from_slice(&[0, 0, 0, 0]);
+            }
+        }
+    }
+
+    ksni::Icon {
+        width: ICON_SIZE,
+        height: ICON_SIZE,
+        data,
+    }
+}
+
+struct DictationTray {
+    recording: Arc<AtomicBool>,
+}
+
+impl ksni::Tray for DictationTray {
+    fn id(&self) -> String {
+        "dictation-daemon".to_string()
+    }
+
+    fn title(&self) -> String {
+        if self.recording.load(Ordering::Relaxed) {
+            "Dictation (Recording...)".to_string()
+        } else {
+            "Dictation (Ready)".to_string()
+        }
+    }
+
+    fn icon_pixmap(&self) -> Vec<ksni::Icon> {
+        if self.recording.load(Ordering::Relaxed) {
+            vec![make_circle_icon(220, 40, 40)]
+        } else {
+            vec![make_circle_icon(40, 180, 40)]
+        }
+    }
+
+    fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
+        let status = if self.recording.load(Ordering::Relaxed) {
+            "Recording..."
+        } else {
+            "Ready (Ctrl+Shift+Space)"
+        };
+
+        vec![
+            ksni::MenuItem::Standard(ksni::menu::StandardItem {
+                label: status.to_string(),
+                enabled: false,
+                ..Default::default()
+            }),
+            ksni::MenuItem::Separator,
+            ksni::MenuItem::Standard(ksni::menu::StandardItem {
+                label: "Quit".to_string(),
+                activate: Box::new(|_| std::process::exit(0)),
+                ..Default::default()
+            }),
+        ]
+    }
+}
+
+fn main() -> Result<()> {
+    let model_path = std::env::args().nth(1).unwrap_or_else(|| {
+        let home = std::env::var("HOME").unwrap_or_default();
+        format!("{home}/whisper-models/ggml-base.en.bin")
+    });
+
+    println!("Loading Whisper model from {model_path}...");
+    let ctx = WhisperContext::new_with_params(&model_path, WhisperContextParameters::default())
+        .context("Failed to load Whisper model")?;
+    println!("Model loaded.");
+
+    let recording = Arc::new(AtomicBool::new(false));
+    let audio_buf: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
+    let shutdown = Arc::new(AtomicBool::new(false));
+
+    // Register signal handlers: SIGTERM (systemd stop/restart) and SIGINT (Ctrl+C)
+    signal_hook::flag::register(signal_hook::consts::SIGTERM, shutdown.clone())
+        .context("Failed to register SIGTERM handler")?;
+    signal_hook::flag::register(signal_hook::consts::SIGINT, shutdown.clone())
+        .context("Failed to register SIGINT handler")?;
+
+    // System tray icon
+    let tray = DictationTray {
+        recording: recording.clone(),
+    };
+    let tray_service = ksni::TrayService::new(tray);
+    let tray_handle = tray_service.handle();
+    tray_service.spawn();
+
+    // Refresh tray icon on state changes
+    let tray_rec = recording.clone();
+    std::thread::spawn(move || {
+        let mut was_recording = false;
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            let is_recording = tray_rec.load(Ordering::Relaxed);
+            if is_recording != was_recording {
+                tray_handle.update(|_tray: &mut DictationTray| {});
+                was_recording = is_recording;
+            }
+        }
+    });
+
+    // Audio capture setup
+    let host = cpal::default_host();
+    let device = host
+        .default_input_device()
+        .context("No input device available")?;
+    println!("Using input device: {}", device.name().unwrap_or_default());
+
+    let config = cpal::StreamConfig {
+        channels: 1,
+        sample_rate: cpal::SampleRate(SAMPLE_RATE),
+        buffer_size: cpal::BufferSize::Default,
+    };
+
+    let rec_flag = recording.clone();
+    let buf_handle = audio_buf.clone();
+    let stream = device.build_input_stream(
+        &config,
+        move |data: &[f32], _: &cpal::InputCallbackInfo| {
+            if rec_flag.load(Ordering::Relaxed) {
+                if let Ok(mut buf) = buf_handle.lock() {
+                    if buf.len() < MAX_BUFFER_SAMPLES {
+                        let remaining = MAX_BUFFER_SAMPLES - buf.len();
+                        let take = data.len().min(remaining);
+                        buf.extend_from_slice(&data[..take]);
+                        if buf.len() >= MAX_BUFFER_SAMPLES {
+                            rec_flag.store(false, Ordering::SeqCst);
+                            eprintln!("Max recording duration ({MAX_RECORDING_SECS}s) reached, auto-stopping.");
+                        }
+                    }
+                }
+            }
+        },
+        |err| eprintln!("Audio stream error: {err}"),
+        None,
+    )?;
+    stream.play()?;
+
+    println!("\n=== Dictation Daemon Ready (Whisper) ===");
+    println!("Hotkey: Ctrl + Shift + Space");
+    println!("Press the hotkey to start/stop recording.");
+    println!("Transcribed text will be typed into the focused window.");
+    println!("Press Ctrl+C to quit.\n");
+
+    // Global hotkey listener (rdev::listen blocks)
+    let ctrl = Arc::new(AtomicBool::new(false));
+    let shift = Arc::new(AtomicBool::new(false));
+    let last_toggle = Arc::new(AtomicU64::new(0));
+    let processing = Arc::new(AtomicBool::new(false));
+
+    let ctrl_c = ctrl.clone();
+    let shift_c = shift.clone();
+    let rec = recording.clone();
+    let buf = audio_buf.clone();
+    let ctx = Arc::new(ctx);
+    let last_toggle_c = last_toggle.clone();
+    let processing_c = processing.clone();
+
+    std::thread::spawn(move || {
+        rdev::listen(move |event| {
+            match event.event_type {
+                rdev::EventType::KeyPress(key) => match key {
+                    rdev::Key::ControlLeft | rdev::Key::ControlRight => {
+                        ctrl_c.store(true, Ordering::Relaxed);
+                    }
+                    rdev::Key::ShiftLeft | rdev::Key::ShiftRight => {
+                        shift_c.store(true, Ordering::Relaxed);
+                    }
+                    rdev::Key::Space => {
+                        if ctrl_c.load(Ordering::Relaxed) && shift_c.load(Ordering::Relaxed) {
+                            // Skip if currently transcribing/injecting
+                            if processing_c.load(Ordering::SeqCst) {
+                                return;
+                            }
+                            // Debounce: ignore if too soon after last toggle
+                            let now = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_millis() as u64;
+                            let last = last_toggle_c.load(Ordering::SeqCst);
+                            if now.saturating_sub(last) < DEBOUNCE_MS {
+                                return;
+                            }
+                            last_toggle_c.store(now, Ordering::SeqCst);
+                            toggle_dictation(&rec, &buf, &ctx, &processing_c);
+                        }
+                    }
+                    _ => {}
+                },
+                rdev::EventType::KeyRelease(key) => match key {
+                    rdev::Key::ControlLeft | rdev::Key::ControlRight => {
+                        ctrl_c.store(false, Ordering::Relaxed);
+                    }
+                    rdev::Key::ShiftLeft | rdev::Key::ShiftRight => {
+                        shift_c.store(false, Ordering::Relaxed);
+                    }
+                    _ => {}
+                },
+                _ => {}
+            }
+        })
+        .ok();
+    });
+
+    // Wait for shutdown signal, then clean up
+    while !shutdown.load(Ordering::SeqCst) {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    println!("\nShutting down...");
+    release_keys();
+    drop(stream);
+    println!("Goodbye.");
+    Ok(())
+}
+
+fn toggle_dictation(
+    recording: &AtomicBool,
+    audio_buf: &Mutex<Vec<f32>>,
+    ctx: &WhisperContext,
+    processing: &AtomicBool,
+) {
+    let was_recording = recording.load(Ordering::SeqCst);
+    if was_recording {
+        recording.store(false, Ordering::SeqCst);
+        processing.store(true, Ordering::SeqCst);
+        println!("Recording stopped. Transcribing...");
+
+        let samples: Vec<f32> = {
+            let mut b = audio_buf.lock().unwrap();
+            std::mem::take(&mut *b)
+        };
+
+        if samples.is_empty() {
+            println!("No audio captured.");
+            processing.store(false, Ordering::SeqCst);
+            return;
+        }
+
+        let mut state = ctx.create_state().expect("Failed to create Whisper state");
+        let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+        params.set_n_threads(4);
+        params.set_language(Some("en"));
+        params.set_print_progress(false);
+        params.set_print_realtime(false);
+        params.set_print_timestamps(false);
+        params.set_suppress_nst(true);
+
+        state
+            .full(params, &samples)
+            .expect("Whisper transcription failed");
+
+        let num_segments = state.full_n_segments();
+        let mut text = String::new();
+        for i in 0..num_segments {
+            if let Some(segment) = state.get_segment(i) {
+                if let Ok(s) = segment.to_str() {
+                    text.push_str(s);
+                }
+            }
+        }
+        let text = text.trim();
+
+        if text.is_empty() {
+            println!("No speech detected.");
+        } else {
+            let processed = process_text(text);
+            println!("Transcribed: {text}");
+            println!("Processed:   {processed}");
+            inject_text(&processed);
+        }
+        processing.store(false, Ordering::SeqCst);
+    } else {
+        {
+            let mut b = audio_buf.lock().unwrap();
+            b.clear();
+        }
+        recording.store(true, Ordering::SeqCst);
+        println!("Recording started... speak now!");
+    }
+}
+
+// --- Text processing ---
+
+/// Check if words starting at `pos` match a punctuation/coding command.
+/// Returns (replacement string, number of words consumed) or None.
+fn match_command(words: &[&str], pos: usize) -> Option<(&'static str, usize)> {
+    let w1 = words[pos].to_lowercase();
+
+    // Try three-word matches
+    if pos + 2 < words.len() {
+        let w2 = words[pos + 1].to_lowercase();
+        let w3 = words[pos + 2].to_lowercase();
+        let triple = format!("{w1} {w2} {w3}");
+        let matched = match triple.as_str() {
+            "exclamation mark" | "exclamation point" => Some("!"),
+            // Just in case whisper splits differently
+            "open curly brace" | "open curly bracket" => Some("{"),
+            "close curly brace" | "close curly bracket" => Some("}"),
+            "open square bracket" => Some("["),
+            "close square bracket" => Some("]"),
+            "double equal sign" | "double equals sign" => Some("=="),
+            "not equal sign" | "not equals sign" => Some("!="),
+            "fat arrow sign" => Some("=>"),
+            "thin arrow sign" => Some("->"),
+            _ => None,
+        };
+        if let Some(p) = matched {
+            return Some((p, 3));
+        }
+    }
+
+    // Try two-word matches
+    if pos + 1 < words.len() {
+        let w2 = words[pos + 1].to_lowercase();
+        let pair = format!("{w1} {w2}");
+        let matched = match pair.as_str() {
+            // Punctuation
+            "question mark" => Some("?"),
+            "exclamation mark" | "exclamation point" => Some("!"),
+            "full stop" => Some("."),
+            "semi colon" => Some(";"),
+            "open quote" | "open quotes" => Some("\""),
+            "close quote" | "close quotes" => Some("\""),
+            "open paren" | "open parenthesis" => Some("("),
+            "close paren" | "close parenthesis" => Some(")"),
+            "at sign" => Some("@"),
+            "new line" => Some("\n"),
+            "new paragraph" => Some("\n\n"),
+            // Coding - braces & brackets
+            "open brace" | "open braces" | "left brace" => Some("{"),
+            "close brace" | "close braces" | "right brace" => Some("}"),
+            "open bracket" | "left bracket" => Some("["),
+            "close bracket" | "right bracket" => Some("]"),
+            // Coding - operators
+            "double equals" | "double equal" => Some("=="),
+            "not equals" | "not equal" => Some("!="),
+            "fat arrow" => Some("=>"),
+            "thin arrow" | "arrow function" => Some("->"),
+            "plus equals" => Some("+="),
+            "minus equals" => Some("-="),
+            "pipe pipe" | "double pipe" => Some("||"),
+            "and and" | "double ampersand" => Some("&&"),
+            "left shift" => Some("<<"),
+            "right shift" => Some(">>"),
+            "scope resolution" | "double colon" => Some("::"),
+            // Coding - terms
+            "pull request" => Some("PR"),
+            _ => None,
+        };
+        if let Some(p) = matched {
+            return Some((p, 2));
+        }
+    }
+
+    // Single-word matches
+    let matched = match w1.as_str() {
+        // Punctuation
+        "period" => Some("."),
+        "comma" | "karma" => Some(","),
+        "colon" => Some(":"),
+        "semicolon" => Some(";"),
+        "dash" | "hyphen" => Some("-"),
+        "ellipsis" => Some("..."),
+        "apostrophe" => Some("'"),
+        "hashtag" | "hash" => Some("#"),
+        "ampersand" => Some("&"),
+        "slash" => Some("/"),
+        "backslash" => Some("\\"),
+        "newline" => Some("\n"),
+        "underscore" => Some("_"),
+        "tilde" => Some("~"),
+        "backtick" => Some("`"),
+        "caret" => Some("^"),
+        "pipe" => Some("|"),
+        "asterisk" | "star" => Some("*"),
+        "percent" => Some("%"),
+        "dollar" => Some("$"),
+        "bang" => Some("!"),
+        // Coding - operators
+        "equals" => Some("="),
+        "plus" => Some("+"),
+        "minus" => Some("-"),
+        // Coding - brackets (shorthand)
+        "parens" => Some("()"),
+        "braces" => Some("{}"),
+        "brackets" => Some("[]"),
+        "angles" => Some("<>"),
+        _ => None,
+    };
+    matched.map(|p| (p, 1))
+}
+
+/// Map common dev terms to their proper casing/format.
+fn fix_dev_term(word: &str) -> Option<&'static str> {
+    match word.to_lowercase().as_str() {
+        "api" => Some("API"),
+        "apis" => Some("APIs"),
+        "github" => Some("GitHub"),
+        "gitlab" => Some("GitLab"),
+        "bitbucket" => Some("Bitbucket"),
+        "javascript" => Some("JavaScript"),
+        "typescript" => Some("TypeScript"),
+        "python" => Some("Python"),
+        "rust" => Some("Rust"),
+        "golang" | "go lang" => Some("Go"),
+        "html" => Some("HTML"),
+        "css" => Some("CSS"),
+        "json" => Some("JSON"),
+        "yaml" => Some("YAML"),
+        "toml" => Some("TOML"),
+        "sql" => Some("SQL"),
+        "graphql" => Some("GraphQL"),
+        "restful" => Some("RESTful"),
+        "rest" => Some("REST"),
+        "http" => Some("HTTP"),
+        "https" => Some("HTTPS"),
+        "url" => Some("URL"),
+        "urls" => Some("URLs"),
+        "uri" => Some("URI"),
+        "cli" => Some("CLI"),
+        "gui" => Some("GUI"),
+        "ui" => Some("UI"),
+        "ux" => Some("UX"),
+        "ci" => Some("CI"),
+        "cd" => Some("CD"),
+        "pr" => Some("PR"),
+        "prs" => Some("PRs"),
+        "ide" => Some("IDE"),
+        "sdk" => Some("SDK"),
+        "npm" => Some("npm"),
+        "tcp" => Some("TCP"),
+        "udp" => Some("UDP"),
+        "ip" => Some("IP"),
+        "dns" => Some("DNS"),
+        "ssh" => Some("SSH"),
+        "ssl" => Some("SSL"),
+        "tls" => Some("TLS"),
+        "aws" => Some("AWS"),
+        "gcp" => Some("GCP"),
+        "oauth" => Some("OAuth"),
+        "jwt" => Some("JWT"),
+        "uuid" => Some("UUID"),
+        "ascii" => Some("ASCII"),
+        "utf" => Some("UTF"),
+        "regex" => Some("regex"),
+        "stdin" => Some("stdin"),
+        "stdout" => Some("stdout"),
+        "stderr" => Some("stderr"),
+        "nginx" => Some("nginx"),
+        "redis" => Some("Redis"),
+        "postgres" | "postgresql" => Some("PostgreSQL"),
+        "mysql" => Some("MySQL"),
+        "mongodb" => Some("MongoDB"),
+        "docker" => Some("Docker"),
+        "kubernetes" => Some("Kubernetes"),
+        "linux" => Some("Linux"),
+        "macos" => Some("macOS"),
+        "ios" => Some("iOS"),
+        "android" => Some("Android"),
+        "wasm" => Some("WASM"),
+        "webassembly" => Some("WebAssembly"),
+        "localhost" => Some("localhost"),
+        "kubectl" => Some("kubectl"),
+        "keycloak" => Some("Keycloak"),
+        "saltpig" => Some("Saltpig"),
+        "mcp" => Some("MCP"),
+        "zephly" | "zephli" => Some("Zephly"),
+        _ => None,
+    }
+}
+
+fn process_text(text: &str) -> String {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    let mut result = String::new();
+    let mut capitalize_next = true;
+    let mut i = 0;
+
+    while i < words.len() {
+        if let Some((replacement, consumed)) = match_command(&words, i) {
+            result.push_str(replacement);
+            if matches!(replacement, "." | "?" | "!" | "..." | "\n" | "\n\n") {
+                capitalize_next = true;
+            }
+            i += consumed;
+        } else {
+            // Regular word - check for dev term first
+            let word = if let Some(term) = fix_dev_term(words[i]) {
+                term
+            } else {
+                words[i]
+            };
+
+            if !result.is_empty()
+                && !result.ends_with('\n')
+                && !result.ends_with('(')
+                && !result.ends_with('"')
+                && !result.ends_with('{')
+                && !result.ends_with('[')
+            {
+                result.push(' ');
+            }
+
+            if capitalize_next && fix_dev_term(words[i]).is_none() {
+                let mut chars = word.chars();
+                if let Some(first) = chars.next() {
+                    result.extend(first.to_uppercase());
+                    result.push_str(chars.as_str());
+                }
+                capitalize_next = false;
+            } else {
+                result.push_str(word);
+                capitalize_next = false;
+            }
+            i += 1;
+        }
+    }
+
+    result
+}
+
+fn release_keys() {
+    // Release Space (57), Left Ctrl (29), Right Ctrl (97), Left Shift (42), Right Shift (54)
+    let _ = Command::new("ydotool")
+        .args(["key", "57:0", "29:0", "97:0", "42:0", "54:0"])
+        .status();
+}
+
+fn inject_text(text: &str) {
+    match Command::new("ydotool")
+        .args(["type", "--", text])
+        .status()
+    {
+        Ok(status) if status.success() => {
+            println!("Text injected via ydotool.");
+        }
+        _ => {
+            match Command::new("wtype").arg(text).status() {
+                Ok(status) if status.success() => {
+                    println!("Text injected via wtype.");
+                }
+                _ => {
+                    eprintln!("Failed to inject text. Install ydotool or wtype.");
+                }
+            }
+        }
+    }
+}
