@@ -10,6 +10,7 @@ A local, privacy-focused dictation daemon for Linux. Press a hotkey, speak, and 
 - **Desktop-agnostic** — KDE, GNOME, Sway, Hyprland, etc.
 - **System tray icon** — visual recording indicator (green = ready, red = recording)
 - **Smart Punctuation** — Whisper auto-punctuates by default; toggle off in tray menu if you prefer voice commands for punctuation
+- **Pause media on record** — automatically pauses playing music/media when you start recording, resumes when done (toggle in tray menu)
 - **Voice commands** — built-in coding symbol dictation (braces, arrows, operators, etc.)
 - **Auto-stop safety** — recording caps at 60 seconds to prevent runaway capture
 - **Clean shutdown** — releases all key state on SIGTERM/SIGINT
@@ -20,6 +21,7 @@ A local, privacy-focused dictation daemon for Linux. Press a hotkey, speak, and 
 - Rust toolchain (for building)
 - A Whisper GGML model file
 - **ydotool** (recommended) or **wtype** for text injection
+- **playerctl** (optional, for media pause/resume — falls back to dbus-send)
 - A microphone
 
 ## Installation
@@ -28,19 +30,19 @@ A local, privacy-focused dictation daemon for Linux. Press a hotkey, speak, and 
 
 **Arch/Manjaro:**
 ```bash
-sudo pacman -S base-devel cmake ydotool
+sudo pacman -S base-devel cmake ydotool playerctl
 sudo systemctl enable --now ydotool
 ```
 
 **Ubuntu/Debian:**
 ```bash
-sudo apt install build-essential cmake libclang-dev libasound2-dev libdbus-1-dev ydotool
+sudo apt install build-essential cmake libclang-dev libasound2-dev libdbus-1-dev ydotool playerctl
 sudo systemctl enable --now ydotool
 ```
 
 **Fedora:**
 ```bash
-sudo dnf install gcc cmake clang-devel alsa-lib-devel dbus-devel ydotool
+sudo dnf install gcc cmake clang-devel alsa-lib-devel dbus-devel ydotool playerctl
 sudo systemctl enable --now ydotool
 ```
 
@@ -125,6 +127,16 @@ If you prefer to control punctuation yourself by saying "comma", "period", etc.,
 | "new paragraph" | double newline |
 | "open quote" / "close quote" | `"` |
 | "open paren" / "close paren" | `(` `)` |
+
+### Pause Media on Record
+
+By default, **Pause Media on Record is ON**. When you start recording, any playing media (Spotify, Firefox, VLC, etc.) is automatically paused via MPRIS. When transcription and text injection finish, playback resumes.
+
+This only resumes media that was actually playing when you started recording — if you paused your music manually before dictating, it stays paused.
+
+Toggle this in the tray menu under **Pause Media on Record: ON/OFF**.
+
+Requires `playerctl` for best results. Falls back to `dbus-send` if playerctl is not installed.
 
 ### Voice commands
 
@@ -231,18 +243,22 @@ Ctrl+Shift+Space
         |          START            STOP
         |        (record)       (transcribe)
         |              |               |
-        |              v               v
-        |         cpal audio      whisper-rs
-        |         stream ──>      inference
-        |         buffer             |
-        |                            v
-        |                     process_text()
-        |                     (punctuation,
-        |                      dev terms)
+        |         media_pause()        v
+        |         (playerctl)     whisper-rs
+        |              |          inference
+        |              v               |
+        |         cpal audio           v
+        |         stream ──>    process_text()
+        |         buffer        (punctuation,
+        |                        dev terms)
         |                            |
         |                            v
         |                     inject_text()
         |                     (ydotool/wtype)
+        |                            |
+        |                            v
+        |                      media_play()
+        |                      (playerctl)
         v
   System tray icon
   (green/red indicator)
