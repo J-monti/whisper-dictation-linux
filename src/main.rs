@@ -47,6 +47,7 @@ fn make_circle_icon(r: u8, g: u8, b: u8) -> ksni::Icon {
 
 struct DictationTray {
     recording: Arc<AtomicBool>,
+    smart_punctuation: Arc<AtomicBool>,
 }
 
 impl ksni::Tray for DictationTray {
@@ -77,10 +78,27 @@ impl ksni::Tray for DictationTray {
             "Ready (Ctrl+Shift+Space)"
         };
 
+        let smart_punct_label = if self.smart_punctuation.load(Ordering::Relaxed) {
+            "Smart Punctuation: ON"
+        } else {
+            "Smart Punctuation: OFF"
+        };
+
         vec![
             ksni::MenuItem::Standard(ksni::menu::StandardItem {
                 label: status.to_string(),
                 enabled: false,
+                ..Default::default()
+            }),
+            ksni::MenuItem::Separator,
+            ksni::MenuItem::Standard(ksni::menu::StandardItem {
+                label: smart_punct_label.to_string(),
+                activate: Box::new(|tray: &mut Self| {
+                    let current = tray.smart_punctuation.load(Ordering::SeqCst);
+                    tray.smart_punctuation.store(!current, Ordering::SeqCst);
+                    let state = if !current { "ON" } else { "OFF" };
+                    println!("Smart Punctuation: {state}");
+                }),
                 ..Default::default()
             }),
             ksni::MenuItem::Separator,
@@ -106,6 +124,7 @@ fn main() -> Result<()> {
 
     let recording = Arc::new(AtomicBool::new(false));
     let audio_buf: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
+    let smart_punctuation = Arc::new(AtomicBool::new(true));
     let shutdown = Arc::new(AtomicBool::new(false));
 
     // Register signal handlers: SIGTERM (systemd stop/restart) and SIGINT (Ctrl+C)
@@ -117,6 +136,7 @@ fn main() -> Result<()> {
     // System tray icon
     let tray = DictationTray {
         recording: recording.clone(),
+        smart_punctuation: smart_punctuation.clone(),
     };
     let tray_service = ksni::TrayService::new(tray);
     let tray_handle = tray_service.handle();
@@ -192,6 +212,7 @@ fn main() -> Result<()> {
     let ctx = Arc::new(ctx);
     let last_toggle_c = last_toggle.clone();
     let processing_c = processing.clone();
+    let smart_punct_c = smart_punctuation.clone();
 
     std::thread::spawn(move || {
         rdev::listen(move |event| {
@@ -219,7 +240,7 @@ fn main() -> Result<()> {
                                 return;
                             }
                             last_toggle_c.store(now, Ordering::SeqCst);
-                            toggle_dictation(&rec, &buf, &ctx, &processing_c);
+                            toggle_dictation(&rec, &buf, &ctx, &processing_c, &smart_punct_c);
                         }
                     }
                     _ => {}
@@ -256,6 +277,7 @@ fn toggle_dictation(
     audio_buf: &Mutex<Vec<f32>>,
     ctx: &WhisperContext,
     processing: &AtomicBool,
+    smart_punctuation: &AtomicBool,
 ) {
     let was_recording = recording.load(Ordering::SeqCst);
     if was_recording {
@@ -301,7 +323,8 @@ fn toggle_dictation(
         if text.is_empty() {
             println!("No speech detected.");
         } else {
-            let processed = process_text(text);
+            let skip_punct = smart_punctuation.load(Ordering::Relaxed);
+            let processed = process_text(text, skip_punct);
             println!("Transcribed: {text}");
             println!("Processed:   {processed}");
             inject_text(&processed);
@@ -321,7 +344,11 @@ fn toggle_dictation(
 
 /// Check if words starting at `pos` match a punctuation/coding command.
 /// Returns (replacement string, number of words consumed) or None.
-fn match_command(words: &[&str], pos: usize) -> Option<(&'static str, usize)> {
+///
+/// When `skip_punctuation` is true (Smart Punctuation ON), basic punctuation
+/// commands are ignored since Whisper already inserts them automatically.
+/// Coding/special commands are always active.
+fn match_command(words: &[&str], pos: usize, skip_punctuation: bool) -> Option<(&'static str, usize)> {
     let w1 = words[pos].to_lowercase();
 
     // Try three-word matches
@@ -330,8 +357,7 @@ fn match_command(words: &[&str], pos: usize) -> Option<(&'static str, usize)> {
         let w3 = words[pos + 2].to_lowercase();
         let triple = format!("{w1} {w2} {w3}");
         let matched = match triple.as_str() {
-            "exclamation mark" | "exclamation point" => Some("!"),
-            // Just in case whisper splits differently
+            "exclamation mark" | "exclamation point" if !skip_punctuation => Some("!"),
             "open curly brace" | "open curly bracket" => Some("{"),
             "close curly brace" | "close curly bracket" => Some("}"),
             "open square bracket" => Some("["),
@@ -352,24 +378,23 @@ fn match_command(words: &[&str], pos: usize) -> Option<(&'static str, usize)> {
         let w2 = words[pos + 1].to_lowercase();
         let pair = format!("{w1} {w2}");
         let matched = match pair.as_str() {
-            // Punctuation
-            "question mark" => Some("?"),
-            "exclamation mark" | "exclamation point" => Some("!"),
-            "full stop" => Some("."),
-            "semi colon" => Some(";"),
-            "open quote" | "open quotes" => Some("\""),
-            "close quote" | "close quotes" => Some("\""),
-            "open paren" | "open parenthesis" => Some("("),
-            "close paren" | "close parenthesis" => Some(")"),
-            "at sign" => Some("@"),
-            "new line" => Some("\n"),
-            "new paragraph" => Some("\n\n"),
-            // Coding - braces & brackets
+            // Punctuation (skipped when Smart Punctuation is ON)
+            "question mark" if !skip_punctuation => Some("?"),
+            "exclamation mark" | "exclamation point" if !skip_punctuation => Some("!"),
+            "full stop" if !skip_punctuation => Some("."),
+            "semi colon" if !skip_punctuation => Some(";"),
+            "open quote" | "open quotes" if !skip_punctuation => Some("\""),
+            "close quote" | "close quotes" if !skip_punctuation => Some("\""),
+            "open paren" | "open parenthesis" if !skip_punctuation => Some("("),
+            "close paren" | "close parenthesis" if !skip_punctuation => Some(")"),
+            "at sign" if !skip_punctuation => Some("@"),
+            "new line" if !skip_punctuation => Some("\n"),
+            "new paragraph" if !skip_punctuation => Some("\n\n"),
+            // Coding - always active
             "open brace" | "open braces" | "left brace" => Some("{"),
             "close brace" | "close braces" | "right brace" => Some("}"),
             "open bracket" | "left bracket" => Some("["),
             "close bracket" | "right bracket" => Some("]"),
-            // Coding - operators
             "double equals" | "double equal" => Some("=="),
             "not equals" | "not equal" => Some("!="),
             "fat arrow" => Some("=>"),
@@ -381,7 +406,6 @@ fn match_command(words: &[&str], pos: usize) -> Option<(&'static str, usize)> {
             "left shift" => Some("<<"),
             "right shift" => Some(">>"),
             "scope resolution" | "double colon" => Some("::"),
-            // Coding - terms
             "pull request" => Some("PR"),
             _ => None,
         };
@@ -392,19 +416,21 @@ fn match_command(words: &[&str], pos: usize) -> Option<(&'static str, usize)> {
 
     // Single-word matches
     let matched = match w1.as_str() {
-        // Punctuation
-        "period" => Some("."),
-        "comma" | "karma" => Some(","),
-        "colon" => Some(":"),
-        "semicolon" => Some(";"),
-        "dash" | "hyphen" => Some("-"),
-        "ellipsis" => Some("..."),
-        "apostrophe" => Some("'"),
+        // Punctuation (skipped when Smart Punctuation is ON)
+        "period" if !skip_punctuation => Some("."),
+        "comma" | "karma" if !skip_punctuation => Some(","),
+        "colon" if !skip_punctuation => Some(":"),
+        "semicolon" if !skip_punctuation => Some(";"),
+        "dash" | "hyphen" if !skip_punctuation => Some("-"),
+        "ellipsis" if !skip_punctuation => Some("..."),
+        "apostrophe" if !skip_punctuation => Some("'"),
+        "newline" if !skip_punctuation => Some("\n"),
+        "bang" if !skip_punctuation => Some("!"),
+        // Coding/special - always active
         "hashtag" | "hash" => Some("#"),
         "ampersand" => Some("&"),
         "slash" => Some("/"),
         "backslash" => Some("\\"),
-        "newline" => Some("\n"),
         "underscore" => Some("_"),
         "tilde" => Some("~"),
         "backtick" => Some("`"),
@@ -413,12 +439,9 @@ fn match_command(words: &[&str], pos: usize) -> Option<(&'static str, usize)> {
         "asterisk" | "star" => Some("*"),
         "percent" => Some("%"),
         "dollar" => Some("$"),
-        "bang" => Some("!"),
-        // Coding - operators
         "equals" => Some("="),
         "plus" => Some("+"),
         "minus" => Some("-"),
-        // Coding - brackets (shorthand)
         "parens" => Some("()"),
         "braces" => Some("{}"),
         "brackets" => Some("[]"),
@@ -507,14 +530,14 @@ fn fix_dev_term(word: &str) -> Option<&'static str> {
     }
 }
 
-fn process_text(text: &str) -> String {
+fn process_text(text: &str, skip_punctuation: bool) -> String {
     let words: Vec<&str> = text.split_whitespace().collect();
     let mut result = String::new();
-    let mut capitalize_next = true;
+    let mut capitalize_next = !skip_punctuation;
     let mut i = 0;
 
     while i < words.len() {
-        if let Some((replacement, consumed)) = match_command(&words, i) {
+        if let Some((replacement, consumed)) = match_command(&words, i, skip_punctuation) {
             result.push_str(replacement);
             if matches!(replacement, "." | "?" | "!" | "..." | "\n" | "\n\n") {
                 capitalize_next = true;

@@ -9,7 +9,8 @@ A local, privacy-focused dictation daemon for Linux. Press a hotkey, speak, and 
 - **Works on Wayland and X11** — text injection via ydotool or wtype
 - **Desktop-agnostic** — KDE, GNOME, Sway, Hyprland, etc.
 - **System tray icon** — visual recording indicator (green = ready, red = recording)
-- **Voice commands** — built-in punctuation and coding symbol dictation
+- **Smart Punctuation** — Whisper auto-punctuates by default; toggle off in tray menu if you prefer voice commands for punctuation
+- **Voice commands** — built-in coding symbol dictation (braces, arrows, operators, etc.)
 - **Auto-stop safety** — recording caps at 60 seconds to prevent runaway capture
 - **Clean shutdown** — releases all key state on SIGTERM/SIGINT
 
@@ -104,11 +105,11 @@ By default the daemon looks for `~/whisper-models/ggml-base.en.bin`. To use a di
 dictation /path/to/your/ggml-model.bin
 ```
 
-### Voice commands
+### Smart Punctuation
 
-You can dictate punctuation and programming symbols by saying their names:
+By default, **Smart Punctuation is ON**. Whisper automatically adds commas, periods, question marks, and other punctuation to your text — you just speak naturally.
 
-**Punctuation:**
+If you prefer to control punctuation yourself by saying "comma", "period", etc., right-click the tray icon and toggle **Smart Punctuation: OFF**. This enables the full set of punctuation voice commands:
 
 | Say | Types |
 |-----|-------|
@@ -124,6 +125,10 @@ You can dictate punctuation and programming symbols by saying their names:
 | "new paragraph" | double newline |
 | "open quote" / "close quote" | `"` |
 | "open paren" / "close paren" | `(` `)` |
+
+### Voice commands
+
+Coding and special symbol commands are **always active** regardless of the Smart Punctuation setting:
 
 **Programming:**
 
