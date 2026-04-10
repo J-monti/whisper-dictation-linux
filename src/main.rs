@@ -48,6 +48,7 @@ fn make_circle_icon(r: u8, g: u8, b: u8) -> ksni::Icon {
 struct DictationTray {
     recording: Arc<AtomicBool>,
     smart_punctuation: Arc<AtomicBool>,
+    pause_media: Arc<AtomicBool>,
 }
 
 impl ksni::Tray for DictationTray {
@@ -84,6 +85,12 @@ impl ksni::Tray for DictationTray {
             "Smart Punctuation: OFF"
         };
 
+        let pause_media_label = if self.pause_media.load(Ordering::Relaxed) {
+            "Pause Media on Record: ON"
+        } else {
+            "Pause Media on Record: OFF"
+        };
+
         vec![
             ksni::MenuItem::Standard(ksni::menu::StandardItem {
                 label: status.to_string(),
@@ -98,6 +105,16 @@ impl ksni::Tray for DictationTray {
                     tray.smart_punctuation.store(!current, Ordering::SeqCst);
                     let state = if !current { "ON" } else { "OFF" };
                     println!("Smart Punctuation: {state}");
+                }),
+                ..Default::default()
+            }),
+            ksni::MenuItem::Standard(ksni::menu::StandardItem {
+                label: pause_media_label.to_string(),
+                activate: Box::new(|tray: &mut Self| {
+                    let current = tray.pause_media.load(Ordering::SeqCst);
+                    tray.pause_media.store(!current, Ordering::SeqCst);
+                    let state = if !current { "ON" } else { "OFF" };
+                    println!("Pause Media on Record: {state}");
                 }),
                 ..Default::default()
             }),
@@ -125,6 +142,7 @@ fn main() -> Result<()> {
     let recording = Arc::new(AtomicBool::new(false));
     let audio_buf: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
     let smart_punctuation = Arc::new(AtomicBool::new(true));
+    let pause_media = Arc::new(AtomicBool::new(true));
     let shutdown = Arc::new(AtomicBool::new(false));
 
     // Register signal handlers: SIGTERM (systemd stop/restart) and SIGINT (Ctrl+C)
@@ -137,6 +155,7 @@ fn main() -> Result<()> {
     let tray = DictationTray {
         recording: recording.clone(),
         smart_punctuation: smart_punctuation.clone(),
+        pause_media: pause_media.clone(),
     };
     let tray_service = ksni::TrayService::new(tray);
     let tray_handle = tray_service.handle();
@@ -204,6 +223,7 @@ fn main() -> Result<()> {
     let shift = Arc::new(AtomicBool::new(false));
     let last_toggle = Arc::new(AtomicU64::new(0));
     let processing = Arc::new(AtomicBool::new(false));
+    let media_was_playing = Arc::new(AtomicBool::new(false));
 
     let ctrl_c = ctrl.clone();
     let shift_c = shift.clone();
@@ -213,6 +233,8 @@ fn main() -> Result<()> {
     let last_toggle_c = last_toggle.clone();
     let processing_c = processing.clone();
     let smart_punct_c = smart_punctuation.clone();
+    let pause_media_c = pause_media.clone();
+    let media_was_playing_c = media_was_playing.clone();
 
     std::thread::spawn(move || {
         rdev::listen(move |event| {
@@ -240,7 +262,7 @@ fn main() -> Result<()> {
                                 return;
                             }
                             last_toggle_c.store(now, Ordering::SeqCst);
-                            toggle_dictation(&rec, &buf, &ctx, &processing_c, &smart_punct_c);
+                            toggle_dictation(&rec, &buf, &ctx, &processing_c, &smart_punct_c, &pause_media_c, &media_was_playing_c);
                         }
                     }
                     _ => {}
@@ -278,12 +300,16 @@ fn toggle_dictation(
     ctx: &WhisperContext,
     processing: &AtomicBool,
     smart_punctuation: &AtomicBool,
+    pause_media: &AtomicBool,
+    media_was_playing: &AtomicBool,
 ) {
     let was_recording = recording.load(Ordering::SeqCst);
     if was_recording {
         recording.store(false, Ordering::SeqCst);
         processing.store(true, Ordering::SeqCst);
         println!("Recording stopped. Transcribing...");
+
+        let should_resume = media_was_playing.load(Ordering::SeqCst);
 
         let samples: Vec<f32> = {
             let mut b = audio_buf.lock().unwrap();
@@ -292,6 +318,9 @@ fn toggle_dictation(
 
         if samples.is_empty() {
             println!("No audio captured.");
+            if should_resume {
+                media_play();
+            }
             processing.store(false, Ordering::SeqCst);
             return;
         }
@@ -329,8 +358,17 @@ fn toggle_dictation(
             println!("Processed:   {processed}");
             inject_text(&processed);
         }
+        if should_resume {
+            media_play();
+        }
         processing.store(false, Ordering::SeqCst);
     } else {
+        let should_pause = pause_media.load(Ordering::Relaxed);
+        let was_playing = should_pause && media_is_playing();
+        media_was_playing.store(was_playing, Ordering::SeqCst);
+        if was_playing {
+            media_pause();
+        }
         {
             let mut b = audio_buf.lock().unwrap();
             b.clear();
@@ -577,6 +615,54 @@ fn process_text(text: &str, skip_punctuation: bool) -> String {
     }
 
     result
+}
+
+/// Check if any MPRIS media player is currently playing.
+fn media_is_playing() -> bool {
+    Command::new("playerctl")
+        .args(["status"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "Playing")
+        .unwrap_or(false)
+}
+
+/// Pause all playing MPRIS media players. Uses playerctl, falls back to dbus-send.
+fn media_pause() {
+    match Command::new("playerctl").args(["--all-players", "pause"]).status() {
+        Ok(status) if status.success() => {
+            println!("Media paused via playerctl.");
+        }
+        _ => {
+            // Fallback: pause via dbus-send to the MPRIS interface
+            let _ = Command::new("dbus-send")
+                .args([
+                    "--type=method_call",
+                    "--dest=org.mpris.MediaPlayer2.playerctld",
+                    "/org/mpris/MediaPlayer2",
+                    "org.mpris.MediaPlayer2.Player.Pause",
+                ])
+                .status();
+        }
+    }
+}
+
+/// Resume playback on MPRIS media players. Uses playerctl, falls back to dbus-send.
+fn media_play() {
+    match Command::new("playerctl").args(["play"]).status() {
+        Ok(status) if status.success() => {
+            println!("Media resumed via playerctl.");
+        }
+        _ => {
+            let _ = Command::new("dbus-send")
+                .args([
+                    "--type=method_call",
+                    "--dest=org.mpris.MediaPlayer2.playerctld",
+                    "/org/mpris/MediaPlayer2",
+                    "org.mpris.MediaPlayer2.Player.Play",
+                ])
+                .status();
+        }
+    }
 }
 
 fn release_keys() {
