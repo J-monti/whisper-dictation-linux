@@ -1,299 +1,248 @@
-# KDE Vosk Dictation - Proof of Concept
+# whisper-dictation-linux
 
-A local, privacy-focused dictation system for KDE Plasma on Wayland using the Vosk speech recognition engine.
+A local, privacy-focused dictation daemon for Linux. Press a hotkey, speak, and text appears at your cursor. Powered by [OpenAI Whisper](https://github.com/openai/whisper) running entirely on your machine — no cloud services, no data leaves your computer.
 
 ## Features
 
-- ✅ **Fully Local** - All processing happens on your machine
-- ✅ **Privacy-First** - No cloud services, no data sent anywhere
-- ✅ **Wayland Support** - Works on modern KDE Plasma Wayland sessions
-- ✅ **Global Hotkey** - Press Ctrl+Shift+Space to dictate anywhere
-- ✅ **System Tray Integration** - Visual feedback and manual controls
-- ✅ **Lightweight** - Uses efficient Vosk models (50MB - 2GB)
+- **Fully local** — all speech recognition runs on-device via Whisper
+- **Global hotkey** — Ctrl+Shift+Space to start/stop dictation from anywhere
+- **Works on Wayland and X11** — text injection via ydotool or wtype
+- **Desktop-agnostic** — KDE, GNOME, Sway, Hyprland, etc.
+- **System tray icon** — visual recording indicator (green = ready, red = recording)
+- **Voice commands** — built-in punctuation and coding symbol dictation
+- **Auto-stop safety** — recording caps at 60 seconds to prevent runaway capture
+- **Clean shutdown** — releases all key state on SIGTERM/SIGINT
 
-## System Requirements
+## Requirements
 
-- KDE Plasma (Wayland or X11)
-- Python 3.7+
-- Microphone
-- ~500MB disk space (for models)
+- Linux (Wayland or X11)
+- Rust toolchain (for building)
+- A Whisper GGML model file
+- **ydotool** (recommended) or **wtype** for text injection
+- A microphone
 
 ## Installation
 
-### 1. Install System Dependencies
+### 1. Install system dependencies
 
-**On Arch/Manjaro:**
+**Arch/Manjaro:**
 ```bash
-sudo pacman -S python-pyaudio python-pyqt5 portaudio wtype
-```
-
-**On Ubuntu/Debian:**
-```bash
-sudo apt install python3-pyaudio python3-pyqt5 portaudio19-dev wtype
-```
-
-**On Fedora:**
-```bash
-sudo dnf install python3-pyaudio python3-qt5 portaudio-devel wtype
-```
-
-> **Note:** `wtype` is the recommended tool for Wayland text injection. If not available in your repos, you can compile it from [source](https://github.com/atx/wtype) or use `ydotool` as an alternative.
-
-### 2. Install Python Dependencies
-
-```bash
-cd kde-vosk-dictation
-pip install -r requirements.txt
-```
-
-### 3. Download a Vosk Model
-
-Vosk offers several model sizes. Start with the small English model:
-
-```bash
-# Create models directory
-mkdir -p ~/vosk-models
-cd ~/vosk-models
-
-# Download small English model (~40MB)
-wget https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip
-unzip vosk-model-small-en-us-0.15.zip
-
-# Or download the larger, more accurate model (~1.8GB)
-# wget https://alphacephei.com/vosk/models/vosk-model-en-us-0.22.zip
-# unzip vosk-model-en-us-0.22.zip
-```
-
-**Available models:** https://alphacephei.com/vosk/models
-
-Languages supported include: English, Spanish, French, German, Russian, Chinese, and many more!
-
-### 4. Install Text Injection Tool (Wayland)
-
-For Wayland, you need one of these tools:
-
-**Option A: wtype (Recommended)**
-```bash
-# Arch
-sudo pacman -S wtype
-
-# Or build from source
-git clone https://github.com/atx/wtype
-cd wtype
-meson build
-ninja -C build
-sudo ninja -C build install
-```
-
-**Option B: ydotool (Alternative)**
-```bash
-# Arch
-yay -S ydotool-git
-
-# Ubuntu (requires manual build)
-git clone https://github.com/ReimuNotMoe/ydotool
-cd ydotool
-mkdir build && cd build
-cmake ..
-make
-sudo make install
-
-# Start ydotool daemon
+sudo pacman -S base-devel cmake ydotool
 sudo systemctl enable --now ydotool
 ```
 
+**Ubuntu/Debian:**
+```bash
+sudo apt install build-essential cmake libclang-dev libasound2-dev libdbus-1-dev ydotool
+sudo systemctl enable --now ydotool
+```
+
+**Fedora:**
+```bash
+sudo dnf install gcc cmake clang-devel alsa-lib-devel dbus-devel ydotool
+sudo systemctl enable --now ydotool
+```
+
+> **Note:** ydotool requires its daemon running (`ydotoold`). The systemd service handles this. Your user needs to be in the `input` group: `sudo usermod -aG input $USER` (then log out/in).
+
+### 2. Download a Whisper model
+
+```bash
+mkdir -p ~/whisper-models
+cd ~/whisper-models
+
+# Base English model (~150MB) — good balance of speed and accuracy
+wget https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin
+```
+
+Other model sizes (speed vs. accuracy tradeoff):
+
+| Model | Size | Notes |
+|-------|------|-------|
+| `ggml-tiny.en.bin` | ~75MB | Fastest, lower accuracy |
+| `ggml-base.en.bin` | ~150MB | Good default |
+| `ggml-small.en.bin` | ~500MB | Better accuracy |
+| `ggml-medium.en.bin` | ~1.5GB | High accuracy, slower |
+
+Browse all models at [huggingface.co/ggerganov/whisper.cpp](https://huggingface.co/ggerganov/whisper.cpp/tree/main).
+
+### 3. Build and install
+
+```bash
+git clone https://github.com/J-monti/whisper-dictation-linux.git
+cd whisper-dictation-linux
+./install.sh
+```
+
+This builds the release binary, installs it to `~/.local/bin/`, and sets up a systemd user service that starts automatically on login.
+
+**Or build manually:**
+```bash
+cargo build --release
+./target/release/dictation
+```
+
+### 4. Verify it's running
+
+```bash
+systemctl --user status dictation
+```
+
+You should see a green or red circle in your system tray.
+
 ## Usage
 
-### Running the Daemon
+1. **Press Ctrl+Shift+Space** — starts recording (tray icon turns red)
+2. **Speak** — say what you want typed
+3. **Press Ctrl+Shift+Space again** — stops recording, transcribes, and types the text at your cursor
+
+### Custom model path
+
+By default the daemon looks for `~/whisper-models/ggml-base.en.bin`. To use a different model:
 
 ```bash
-cd kde-vosk-dictation
-chmod +x dictation_daemon.py
-
-# Run with default model location
-./dictation_daemon.py
-
-# Or specify a custom model path
-./dictation_daemon.py ~/vosk-models/vosk-model-small-en-us-0.15
+dictation /path/to/your/ggml-model.bin
 ```
 
-### Dictating
+### Voice commands
 
-1. **Start Recording**: Press `Ctrl+Shift+Space` (or click the system tray icon)
-2. **Speak Clearly**: Say what you want to type
-3. **Stop Recording**: Press `Ctrl+Shift+Space` again
-4. **Text Appears**: The transcribed text will be inserted at your cursor
+You can dictate punctuation and programming symbols by saying their names:
 
-### System Tray
+**Punctuation:**
 
-The microphone icon in your system tray shows the current status:
-- **Inactive**: Ready to record
-- **Recording...**: Listening and processing speech
+| Say | Types |
+|-----|-------|
+| "period" | `.` |
+| "comma" | `,` |
+| "question mark" | `?` |
+| "exclamation mark" | `!` |
+| "colon" | `:` |
+| "semicolon" | `;` |
+| "dash" | `-` |
+| "ellipsis" | `...` |
+| "new line" | newline |
+| "new paragraph" | double newline |
+| "open quote" / "close quote" | `"` |
+| "open paren" / "close paren" | `(` `)` |
 
-Right-click the tray icon for manual controls.
+**Programming:**
 
-## Configuration
+| Say | Types |
+|-----|-------|
+| "open brace" / "close brace" | `{` `}` |
+| "open bracket" / "close bracket" | `[` `]` |
+| "equals" | `=` |
+| "double equals" | `==` |
+| "not equals" | `!=` |
+| "fat arrow" | `=>` |
+| "thin arrow" | `->` |
+| "plus equals" | `+=` |
+| "pipe pipe" | `\|\|` |
+| "double ampersand" | `&&` |
+| "scope resolution" | `::` |
+| "underscore" | `_` |
+| "backtick" | `` ` `` |
+| "hashtag" | `#` |
 
-### Changing the Hotkey
+Common dev terms (API, GitHub, JSON, PostgreSQL, etc.) are automatically capitalized correctly.
 
-Currently hardcoded to `Ctrl+Shift+Space`. To change, edit this line in `dictation_daemon.py`:
-
-```python
-action.setGlobalShortcut(KShortcut("Ctrl+Shift+Space"))
-```
-
-Replace with your preferred combination, e.g., `"Meta+D"`, `"Ctrl+Alt+D"`, etc.
-
-### Using Different Languages
-
-Download the appropriate model from [Vosk Models](https://alphacephei.com/vosk/models) and specify it when starting:
+## Managing the service
 
 ```bash
-# Spanish
-./dictation_daemon.py ~/vosk-models/vosk-model-small-es-0.42
+# Check status
+systemctl --user status dictation
 
-# French  
-./dictation_daemon.py ~/vosk-models/vosk-model-small-fr-0.22
+# View logs
+journalctl --user -u dictation -f
 
-# German
-./dictation_daemon.py ~/vosk-models/vosk-model-small-de-0.15
+# Restart
+systemctl --user restart dictation
+
+# Stop
+systemctl --user stop dictation
+
+# Disable autostart
+systemctl --user disable dictation
 ```
-
-### Model Size vs. Accuracy
-
-| Model Type | Size | Accuracy | Speed | Best For |
-|------------|------|----------|-------|----------|
-| Small | ~40MB | Good | Fast | Quick notes, commands |
-| Medium | ~1GB | Better | Medium | General dictation |
-| Large | ~2GB | Best | Slower | Transcription, accuracy-critical |
 
 ## Troubleshooting
 
-### No Text Appears
+### Text not appearing after dictation
 
-1. **Check if wtype/ydotool is installed:**
-   ```bash
-   which wtype
-   # or
-   which ydotool
-   ```
-
-2. **For ydotool, ensure daemon is running:**
+1. Check that ydotool daemon is running:
    ```bash
    systemctl status ydotool
-   # If not running:
-   sudo systemctl start ydotool
    ```
-
-3. **Check permissions for ydotool:**
+2. Check your user is in the `input` group:
    ```bash
-   sudo usermod -aG input $USER
-   # Log out and back in
+   groups | grep input
    ```
+   If not: `sudo usermod -aG input $USER` and log out/in.
 
-### No Audio/Microphone Not Working
+### Hotkey not responding
 
-1. **Test microphone:**
-   ```bash
-   arecord -d 5 test.wav
-   aplay test.wav
-   ```
-
-2. **Check PulseAudio/PipeWire:**
-   ```bash
-   pactl list sources short
-   ```
-
-3. **Select correct device in PulseAudio settings**
-
-### Global Shortcut Not Working
-
-If PyKDE5 isn't available, the global shortcut won't register automatically. You can:
-
-1. Use the system tray menu to start/stop dictation
-2. Install PyKDE5: `pip install pykde5`
-3. Set up a custom KDE shortcut manually:
-   - System Settings → Shortcuts → Custom Shortcuts
-   - Add new command shortcut
-   - Command: `dbus-send --session --type=method_call --dest=org.kde.VoskDictation /VoskDictation org.kde.VoskDictation.Toggle`
-
-### Model Not Found
-
-Make sure you've downloaded and extracted a Vosk model, and the path is correct:
+Check if another application has grabbed Ctrl+Shift+Space. The daemon uses `rdev` to listen for key events, which requires read access to `/dev/input/` devices.
 
 ```bash
-ls ~/vosk-models/vosk-model-small-en-us-0.15/
-# Should show: am/, conf/, graph/, ivector/ files
+# Check if the daemon is running
+systemctl --user status dictation
+
+# Check logs for errors
+journalctl --user -u dictation --no-pager -n 20
 ```
 
-## Future Enhancements
+### Stuck keys after a crash
 
-This is a proof of concept! Potential improvements:
+If the daemon was killed mid-injection (e.g., `kill -9`), keys can get stuck at the uinput level. Run the included cleanup script:
 
-- [ ] Proper KDE Plasma integration (KWin script)
-- [ ] Configuration GUI
-- [ ] Multiple language switching
-- [ ] Punctuation commands ("period", "comma", etc.)
-- [ ] Custom vocabulary
-- [ ] Real-time streaming transcription
-- [ ] GPU acceleration support
-- [ ] Packaging as a proper KDE service
-- [ ] .desktop file and autostart integration
-
-## Architecture
-
-```
-┌─────────────────────────────────────┐
-│   User presses Ctrl+Shift+Space     │
-└───────────────┬─────────────────────┘
-                │
-                ▼
-┌─────────────────────────────────────┐
-│   DictationDaemon (Qt/DBus)         │
-│   - Global shortcut handler          │
-│   - System tray icon                 │
-└───────────────┬─────────────────────┘
-                │
-                ▼
-┌─────────────────────────────────────┐
-│   AudioRecorder (PyAudio)           │
-│   - Captures microphone input        │
-│   - Streams to Vosk                  │
-└───────────────┬─────────────────────┘
-                │
-                ▼
-┌─────────────────────────────────────┐
-│   Vosk STT Engine                   │
-│   - Processes audio locally          │
-│   - Returns transcribed text         │
-└───────────────┬─────────────────────┘
-                │
-                ▼
-┌─────────────────────────────────────┐
-│   TextInjector (wtype/ydotool)      │
-│   - Injects text at cursor           │
-│   - Works on Wayland & X11           │
-└─────────────────────────────────────┘
+```bash
+./cleanup.sh
 ```
 
-## Contributing
+This releases spacebar, ctrl, and shift via ydotool.
 
-This is a proof of concept! Contributions welcome:
-- Bug fixes
-- Feature additions
-- Better KDE integration
-- Documentation improvements
+### No microphone detected
+
+```bash
+# List audio input devices
+arecord -l
+
+# Test recording
+arecord -d 3 -f S16_LE -r 16000 /tmp/test.wav && aplay /tmp/test.wav
+```
+
+Make sure your microphone is set as the default input device in your audio settings (PulseAudio/PipeWire).
+
+## How it works
+
+```
+Ctrl+Shift+Space
+        |
+        v
+  rdev key listener ──> toggle_dictation()
+        |                      |
+        |              ┌───────┴───────┐
+        |              v               v
+        |          START            STOP
+        |        (record)       (transcribe)
+        |              |               |
+        |              v               v
+        |         cpal audio      whisper-rs
+        |         stream ──>      inference
+        |         buffer             |
+        |                            v
+        |                     process_text()
+        |                     (punctuation,
+        |                      dev terms)
+        |                            |
+        |                            v
+        |                     inject_text()
+        |                     (ydotool/wtype)
+        v
+  System tray icon
+  (green/red indicator)
+```
 
 ## License
 
-MIT License - feel free to use and modify!
-
-## Acknowledgments
-
-- [Vosk](https://alphacephei.com/vosk/) - Fast, offline speech recognition
-- [wtype](https://github.com/atx/wtype) - Wayland text injection
-- [KDE Plasma](https://kde.org/plasma-desktop/) - Amazing desktop environment
-
-## Support
-
-For issues or questions, please open an issue on the repository.
+MIT License. See [LICENSE](LICENSE) for details.

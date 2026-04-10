@@ -1,5 +1,5 @@
 [Unit]
-Description=Dictation Daemon (Vosk speech-to-text)
+Description=Whisper Dictation Daemon (local speech-to-text)
 After=graphical-session.target
 Wants=ydotool.service
 
