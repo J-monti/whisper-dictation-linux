@@ -564,6 +564,7 @@ fn fix_dev_term(word: &str) -> Option<&'static str> {
         "saltpig" => Some("Saltpig"),
         "mcp" => Some("MCP"),
         "zephly" | "zephli" => Some("Zephly"),
+        "maine" => Some("main"),
         _ => None,
     }
 }
